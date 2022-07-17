@@ -2,7 +2,8 @@
 
 namespace App;
 
-use App\Logger;
+use App\Log;
+use App\Write;
 use App\Environment;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
@@ -12,13 +13,11 @@ use Symfony\Component\Console\Formatter\OutputFormatterStyle;
 
 class DeployCommand extends Command
 {
-	protected $higlight; // console output higlight tag
-	protected InputInterface $input;
-	protected OutputInterface $output;
-
 	protected string $clonePath;
 	protected string $nginxUser;
 	protected string $repositoryUrl;
+
+	protected $write;
 
 	public function __construct()
 	{
@@ -44,11 +43,10 @@ class DeployCommand extends Command
 
 	public function execute(InputInterface $input, OutputInterface $output)
 	{
-		// set the $input & $output on the instance
-		$this->input = $input;
-		$this->output = $output;
+		$this->write = new Write($input, $output);
 
-		$this->output->writeln('<question>** STARTING DEPLOYMENT PROCESS **</question>');
+		$this->write->begin();
+
 		$this->preserveAppEnvironment()
 			->cloneApp()
 			->buildUIAssets()
@@ -57,8 +55,9 @@ class DeployCommand extends Command
 			->recreateAppEnvironment()
 			->runMigrations();
 
-		Logger::logDeployment($this->input, $this->output);
-		$this->output->writeln('<info>All done. Your app has been deployed!</info>');
+		Log::logDeployment($input, $output);
+
+		$this->write->done();
 
 		return Command::SUCCESS;
 	}
@@ -69,12 +68,10 @@ class DeployCommand extends Command
 	 */
 	protected function cloneApp()
 	{
-		$this->output->getFormatter()->setStyle('higlight', $this->higlight);
+		$this->write->clone($this->repositoryUrl, $this->clonePath);
 
-		$this->output->writeln(
-			"<info>Cloning '<higlight>{$this->repositoryUrl}</higlight>' into '<higlight>{$this->clonePath}</higlight>'...</info>"
-		);
 		exec('git clone ' . $this->repositoryUrl . ' ' . $this->clonePath);
+
 		return $this;
 	}
 
@@ -84,11 +81,10 @@ class DeployCommand extends Command
 	 */
 	protected function buildUIAssets()
 	{
-		$this->output->writeln(
-			'<info>Installing <higlight>npm</higlight> packages & creating a production build...</info>'
-		);
-		exec('cd ' . $this->clonePath . '&& npm install');
-		exec('cd ' . $this->clonePath . '&& npm run prod');
+		$this->write->buildUI($this->repositoryUrl, $this->clonePath);
+
+		exec('cd ' . $this->clonePath . '&& npm install && npm run prod');
+
 		return $this;
 	}
 
@@ -98,9 +94,7 @@ class DeployCommand extends Command
 	 */
 	protected function setLaravelFilePathPermissions()
 	{
-		$this->output->writeln(
-			"<info>Setting storage & cache permissions for the <higlight>{$this->nginxUser}</higlight> user...</info>"
-		);
+		$this->write->setPermissions($this->nginxUser);
 
 		/*
 		 *	Change the group ownership of the storage and bootstrap/cache directories to $this->nginxUser
@@ -108,10 +102,13 @@ class DeployCommand extends Command
 		 *	"chgrp: $this->nginxUser: illegal group name"
 		 */
 		exec("cd {$this->clonePath} && sudo chgrp -R {$this->nginxUser} storage bootstrap/cache");
-		// Try using just the owner if no group
+
+		//	Try using just the owner if no group
 		exec("cd {$this->clonePath} && sudo chown -R {$this->nginxUser}: storage bootstrap/cache");
-		// recursively grant all permissions, including write and execute, to the group
+
+		//	recursively grant all permissions, including write and execute, to the group
 		exec("cd {$this->clonePath} && sudo chmod -R ug+rwx storage bootstrap/cache");
+
 		return $this;
 	}
 
@@ -121,16 +118,11 @@ class DeployCommand extends Command
 	 */
 	protected function composerInstall()
 	{
-		$this->output->writeln('<info>Installing <higlight>composer</higlight> packages...</info>');
-		exec("cd {$this->clonePath} && composer update");
-		exec("cd {$this->clonePath} && composer install");
-		exec("cd {$this->clonePath} && composer dump-autoload --optimize");
-		$this->output->writeln('<info>Installing <higlight>composer</higlight> packages...</info>');
+		$this->write->composerInstall();
 
-		$this->output->writeln('<question> ---- discovered packages ---- </question>');
-		exec("cd {$this->clonePath} && php artisan package:discover --ansi", $packages);
-		$this->output->writeln($packages);
-		$this->output->writeln('<question> ---- discovered packages ---- </question>');
+		exec(
+			"cd {$this->clonePath} && composer update && composer install && composer dump-autoload --optimize"
+		);
 
 		return $this;
 	}
@@ -141,21 +133,23 @@ class DeployCommand extends Command
 	 */
 	protected function runMigrations()
 	{
-		$this->output->writeln('<info>Running <higlight>php artisan migrate</higlight>...</info>');
+		$this->write->migrations();
+
 		exec("cd {$this->clonePath} && php artisan migrate", $output, $code);
-		$this->output->writeln('<info>' . json_encode($output) . '</info>');
-		// if code is not 0, there is an exception, back out and reverrt the deploy process
-		// move the old code back to the $this->clonePath
-		$this->output->writeln('<info> Code: ' . $code . '</info>');
+
+		$this->write->migrationsConsoleOutput($output, $code);
+
 		return $this;
 	}
 
 	protected function preserveAppEnvironment()
 	{
 		$filepath = realpath(__DIR__ . DIRECTORY_SEPARATOR . '../appenv.txt');
+
 		$laravelExampleEnv = realpath(__DIR__ . DIRECTORY_SEPARATOR . '../laravelDefaultEnv.txt');
+
 		exec("sudo chmod -f 777 {$filepath}", $output, $code);
-		// first default the environment variables the laravel ones
+		//	first default the environment variables the laravel ones
 		//	just in case the appenv.txt exixts with previous variables
 		copy($laravelExampleEnv, $filepath);
 
@@ -170,7 +164,7 @@ class DeployCommand extends Command
 		foreach ($currentEnvironmentVariables as $environmentVariable) {
 			fwrite($resource, $environmentVariable . PHP_EOL);
 		}
-		// instead of removing move to another folder with old timestamp
+		//	instead of removing move to another folder with old timestamp
 		exec("sudo rm -rf {$this->clonePath}");
 
 		return $this;
